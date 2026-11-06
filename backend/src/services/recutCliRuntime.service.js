@@ -28,6 +28,22 @@ function assertCliTrialPolicy({ config, input = {}, targetUri, now = new Date() 
 async function createCliRuntime({ config, input, output, targetUri, allowModel = false, env = process.env, driverLoader, run, resumeCheckpoint, renderOnly = false } = {}) {
   if (!allowModel && !renderOnly) throw fail('尚未授權模型呼叫。', 'RECUT_MODEL_NOT_ALLOWED');
   assertCliTrialPolicy({ config, input, targetUri });
+  // Non-policy generation writes generation-checkpoint.json, plan.json,
+  // full-script.txt and source.json once ('wx') after every model call is spent,
+  // then binds the checkpoint in the local ledger. Check all of that here, before
+  // any provider exists: refuse a folder holding any of those files, claim the
+  // folder exclusively with a lock file (two concurrent runs cannot share it), and
+  // refuse scripts that belong to the paid-policy budget ledger.
+  const claimsLocalGeneration = !config?.trialPolicy && !renderOnly && Boolean(output);
+  if (claimsLocalGeneration) {
+    const directory = path.resolve(output);
+    for (const name of ['generation-checkpoint.json', 'plan.json', 'full-script.txt', 'source.json']) {
+      if (await fs.access(path.join(directory, name)).then(() => true, () => false)) throw fail(`輸出資料夾已有 ${name}，請改用新的 --output。`, 'RECUT_TRIAL_OUTPUT_EXISTS');
+    }
+    await fs.mkdir(directory, { recursive: true });
+    try { await fs.writeFile(path.join(directory, 'generation.lock'), JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }), { flag: 'wx' }); }
+    catch (error) { if (error.code === 'EEXIST') throw fail('輸出資料夾已被另一次試產使用，請改用新的 --output。', 'RECUT_TRIAL_OUTPUT_EXISTS'); throw error; }
+  }
   if (!/^[A-Z][A-Z0-9_]*$/.test(config?.geminiApiKeyEnv || '')) throw fail('須指定金鑰環境變數名稱。', 'RECUT_PROVIDER_NOT_CONFIGURED');
   if (!renderOnly && !env[config.geminiApiKeyEnv]) throw fail(`缺少具名環境變數：${config.geminiApiKeyEnv}`, 'RECUT_PROVIDER_NOT_CONFIGURED');
   const fixedModel = structuredClone(input.model || config.model), fixedCallLimit = input.callLimit || config.callLimit || 5;
@@ -35,6 +51,7 @@ async function createCliRuntime({ config, input, output, targetUri, allowModel =
   const { canonicalSha256 } = require('./recutTrialResume.service');
   const checkpointIdentity = { inputSha256: canonicalSha256(input), configSha256: canonicalSha256(config), policy: config.trialPolicy || null };
   const repository = createRecutLocalRepository({ targetUri, driverLoader });
+  if (claimsLocalGeneration) await repository.assertLocalGenerationAllowed({ input });
   if (!path.isAbsolute(config.media?.allowedRoot || '') || /^[\\/]{2}/.test(config.media.allowedRoot)) throw fail('須指定本機原片目錄。', 'RECUT_SOURCE_UNAVAILABLE');
   const root = await fs.realpath(config.media.allowedRoot);
   const resolveSource = async (file) => {
@@ -110,7 +127,18 @@ async function createCliRuntime({ config, input, output, targetUri, allowModel =
     const actual = await resolveSource(await repository.resolveSourcePath(source.videoId));
     if (!source.sourceSha256 || (await hashLocalFile(actual)).toLowerCase() !== source.sourceSha256.toLowerCase()) throw fail('凍結原片 SHA 不符。', 'RECUT_TRIAL_RESUME_INVALID');
   };
-  return { ...runtime, checkpointIdentity, verifyGenerationSource, verifyTrialGeneration: repository.verifyTrialGeneration,
+  const ledger = config.trialPolicy ? 'budget' : 'local';
+  return { ...runtime, checkpointIdentity, verifyGenerationSource,
+    verifyTrialGeneration: (checkpoint) => repository.verifyTrialGeneration(checkpoint, { ledger }),
+    // Every single-topic run freezes a trusted generation before rendering, so a
+    // render failure or restart can rerender with zero model calls.
+    ...(!config.trialPolicy && !renderOnly ? { onGenerationVerified: async ({ result, source }) => {
+      // The output folder may not exist yet (cached source skips ASR workspaces).
+      await fs.mkdir(path.resolve(output), { recursive: true });
+      const generation = await require('./recutTrialResume.service').writeGenerationCheckpoint({ output, source, result, input, config });
+      await repository.recordLocalGeneration({ input, source, generation });
+      return { ...generation, ledger: 'local' };
+    } } : {}),
     ...(config.trialPolicy ? { reserveTrialBudget: () => repository.reserveTrialBudget({ input, policy: config.trialPolicy, identity: checkpointIdentity }),
     onProgress: async (progress) => {
       const temporary = path.join(output, 'progress-checkpoint.tmp');
